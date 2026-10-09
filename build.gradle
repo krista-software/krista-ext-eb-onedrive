@@ -1,0 +1,196 @@
+plugins {
+    id 'java-library'
+}
+
+group 'app.krista.extensions.Essentials.CloudFiles'
+
+ext {
+    // krista-apis and extension-impl-anno-processors MUST stay on the same version.
+    // >= 1.0.125-sp1 is required for microsoft-auth-sdk + @CatalogRequest(tool = true) support.
+    kristaApisVersion = '1.0.125-sp1'
+}
+
+def computedBaseName = "eb-onedrive-extension"
+def computedVersion = "local"
+
+tasks.register("setReleaseProperties") {
+    dependsOn("generateReleaseProperties")
+    doFirst {
+        def releasePropsFile = file("release.properties")
+        if (releasePropsFile.exists()) {
+            def props = new Properties()
+            releasePropsFile.withInputStream { stream -> props.load(stream) }
+            computedBaseName = (props['extension.name'] ?: computedBaseName).replaceAll(/\s+/, "")
+            computedVersion = props['extension.version'] ?: computedVersion
+            project.ext.set("finalBaseName", computedBaseName)
+            project.version = computedVersion
+            println "Loaded extension name = ${computedBaseName}, version = ${computedVersion}"
+        } else {
+            logger.warn("release.properties not found; using default values.")
+            project.ext.set("finalBaseName", computedBaseName)
+            project.version = computedVersion
+        }
+    }
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+    mavenLocal()
+    maven { url "https://packages.cicd.in.antbrains.com/artifactory/libs-release" }  // internal Krista Artifactory
+    mavenCentral()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs << '-Xlint:all,-serial'
+}
+
+configurations {
+    implementation {
+        canBeConsumed = false
+        canBeResolved = true
+    }
+    // UI-bearing SDK (microsoft-auth-sdk) ships pre-built Setup-tab HTML inside its jar.
+    sdkUi { canBeResolved = true; transitive = false }
+}
+
+dependencies {
+    // --- CORE ---
+    annotationProcessor "app.krista:extension-impl-anno-processors:${kristaApisVersion}"
+    implementation "app.krista:krista-apis:${kristaApisVersion}"
+    implementation 'org.glassfish.hk2:hk2-api:3.0.3'
+
+    // --- Integration ---
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'com.squareup.okhttp3:logging-interceptor:4.12.0'
+    implementation 'com.google.code.gson:gson:2.11.0'
+
+    // --- Microsoft-auth-SDK (Pattern D) ---
+    implementation 'app.krista.sdk:microsoft-auth-sdk:1.0.8'
+    implementation 'com.microsoft.graph:microsoft-graph:5.80.0'
+    implementation 'com.microsoft.graph:microsoft-graph-auth:0.3.0'
+    implementation 'com.azure:azure-identity:1.11.2'
+    sdkUi 'app.krista.sdk:microsoft-auth-sdk:1.0.8'
+
+    // --- Testing ---
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.1'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testImplementation 'org.mockito:mockito-core:5.8.0'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.8.0'
+}
+
+// =====================================================================================================
+// Generate release.properties from the @Extension and @Domain annotations.
+// =====================================================================================================
+import java.util.regex.Pattern
+
+tasks.register('generateReleaseProperties') {
+    group = 'build'
+    description = 'Generates release.properties from @Extension and @Domain annotations'
+    doLast {
+        def extensionFilePath = 'src/main/java/app/krista/extensions/essentials/cloudfiles/ebonedrive/EbOnedriveExtension.java'
+        def areaFilePath = 'src/main/java/app/krista/extensions/essentials/cloudfiles/ebonedrive/catalog/ManagementArea.java'
+        def extensionFile = project.file(extensionFilePath)
+        def areaFile = project.file(areaFilePath)
+        if (!extensionFile.exists()) { throw new GradleException("Extension file not found: ${extensionFilePath}") }
+        if (!areaFile.exists()) { throw new GradleException("Area file not found: ${areaFilePath}") }
+
+        def properties = new Properties()
+        def keyValuePattern = Pattern.compile(/(\w+)\s*=\s*"([^"]+)"/)
+
+        extractAnnotationInfo(extensionFile, "@Extension", keyValuePattern) { key, value ->
+            if (key == "version") { properties.setProperty("extension.version", value) }
+            else if (key == "name") { properties.setProperty("extension.name", value) }
+        }
+        extractAnnotationInfo(areaFile, "@Domain", keyValuePattern) { key, value ->
+            if (key == "name") { properties.setProperty("domain.name", value) }
+            else if (key == "ecosystemName") { properties.setProperty("ecosystem.name", value) }
+        }
+
+        if (!properties.getProperty('extension.name')) { properties.setProperty("extension.name", "EB Onedrive") }
+        if (!properties.getProperty('extension.version')) { throw new GradleException("Could not find extension version in ${extensionFilePath}") }
+        if (!properties.getProperty('domain.name')) { properties.setProperty("domain.name", "Cloud Files") }
+        if (!properties.getProperty('ecosystem.name')) { properties.setProperty("ecosystem.name", "Essentials") }
+
+        def releasePropertiesFile = project.file('release.properties')
+        def content = properties.collect { key, value -> "${key}=${value}" }.join('\n')
+        releasePropertiesFile.text = content + '\n'
+        logger.lifecycle("Generated release.properties:\n${content}")
+    }
+}
+
+def extractAnnotationInfo(File file, String annotationName, Pattern keyValuePattern, Closure processProperty) {
+    StringBuilder annotationText = new StringBuilder()
+    boolean inAnnotation = false
+    file.eachLine { line ->
+        line = line.trim()
+        if (line.contains(annotationName)) { inAnnotation = true; annotationText.setLength(0); annotationText.append(line) }
+        else if (inAnnotation) { annotationText.append(line) }
+        if (inAnnotation && line.contains(")")) {
+            inAnnotation = false
+            def matcher = keyValuePattern.matcher(annotationText.toString())
+            while (matcher.find()) { processProperty.call(matcher.group(1), matcher.group(2)) }
+        }
+    }
+}
+
+// =====================================================================================================
+// Bundle sources into the jar under META-INF/project (platform convention).
+// =====================================================================================================
+tasks.register('createSourceDir', Exec) {
+    dependsOn processResources
+    commandLine "mkdir", "-p", "$projectDir/build/classes/java/main/META-INF/project"
+}
+tasks.register('copyGradleFile', Exec) {
+    dependsOn createSourceDir
+    commandLine "cp", "$projectDir/build.gradle", "$projectDir/build/classes/java/main/META-INF/project/build.gradle"
+}
+tasks.register('includeSources', Exec) {
+    dependsOn copyGradleFile
+    commandLine "cp", "-r", "$projectDir/src", "$projectDir/build/classes/java/main/META-INF/project/src"
+}
+
+// =====================================================================================================
+// UI-bearing SDK resource extraction (microsoft-auth-sdk) — auth/audit tab HTML. No AI Assistant tab
+// (MCP not in scope for this build), so mcp-setup/index.html is intentionally not extracted.
+// =====================================================================================================
+tasks.register('extractSDKResources', Copy) {
+    def sdkJar = configurations.sdkUi.singleFile
+    from(zipTree(sdkJar)) {
+        include 'auth/index.html'
+        include 'audit/index.html'
+    }
+    into("${project.buildDir}/resources/main")
+    includeEmptyDirs = false
+}
+tasks.named('processResources') { dependsOn(tasks.named('extractSDKResources')) }
+tasks.named('compileTestJava') { dependsOn(tasks.named('extractSDKResources')) }
+
+// =====================================================================================================
+// The fat jar.
+// =====================================================================================================
+tasks.named("jar") {
+    dependsOn tasks.named("generateReleaseProperties")
+}
+
+jar {
+    dependsOn tasks.named("setReleaseProperties")
+    dependsOn includeSources
+    archiveBaseName = project.ext.has("finalBaseName") ? project.ext.finalBaseName : "eb-onedrive-extension"
+    manifest {}
+    from { configurations.implementation.collect { it.isDirectory() ? it : zipTree(it) } }
+    exclude 'META-INF/*.RSA', 'META-INF/*.SF', 'META-INF/*.DSA'
+    duplicatesStrategy = "exclude"
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+        exceptionFormat "full"
+    }
+}
